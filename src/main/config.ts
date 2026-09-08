@@ -818,9 +818,31 @@ function ensureClaudeProjectTrust(home: string, cwd: string): void {
       if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
       c = parsed as ClaudeConfig;
     }
-    if (c.projects?.[cwd]?.hasTrustDialogAccepted !== true) {
+    // Claude Code looks this entry up under a path normalised to FORWARD
+    // slashes — its own lookup walks parents with `o.startsWith(r + "/")`, and
+    // the entries it writes on Windows are keyed "C:/Users/…". Writing the raw
+    // Windows path ("C:\Users\…") puts the flag somewhere Claude never reads,
+    // so the agent still hits the interactive "Accessing workspace / Quick
+    // safety check" dialog, which it cannot answer: god exits 1 and every
+    // message to it sits at "waiting" (Windows, verified live on 2.1.263).
+    // Both spellings are written — the normalised one is what current Claude
+    // reads, the raw one keeps older builds working.
+    const keys = Array.from(new Set([cwd.replace(/\\/g, '/'), cwd]));
+    // A bare { hasTrustDialogAccepted } entry is also pruned on Claude's next
+    // save; write the same shape Claude writes. Real existing values win.
+    const shape = {
+      allowedTools: [],
+      mcpContextUris: [],
+      enabledMcpjsonServers: [],
+      disabledMcpjsonServers: [],
+      hasClaudeMdExternalIncludesApproved: false,
+      hasClaudeMdExternalIncludesWarningShown: false,
+    };
+    if (keys.some((k) => c.projects?.[k]?.hasTrustDialogAccepted !== true)) {
       c.projects = c.projects ?? {};
-      c.projects[cwd] = { ...(c.projects[cwd] ?? {}), hasTrustDialogAccepted: true };
+      for (const k of keys) {
+        c.projects[k] = { ...shape, ...(c.projects[k] ?? {}), hasTrustDialogAccepted: true };
+      }
       writeFileSync(p, JSON.stringify(c, null, 2), 'utf8');
     }
   } catch (error) {
