@@ -446,6 +446,16 @@ export class HiveManager {
     return root ? join(root, 'bin', 'hive-proxy.cjs') : null;
   }
 
+  /** The MemPalace wake-up shim: turns `mempalace wake-up` into SessionStart
+   *  `additionalContext` so an agent boots with a recall digest instead of
+   *  having to remember to search. Written in ensureHive alongside cth-hook.cjs.
+   *  Scoped to the per-agent `--settings` file — the user's global
+   *  ~/.claude/settings.json is deliberately never touched. */
+  private wakeupShimPath(): string | null {
+    const root = this.root();
+    return root ? join(root, 'bin', 'mp-wakeup.cjs') : null;
+  }
+
   /**
    * The BUNDLED-NODE launcher: `<root>/bin/hive-node` (POSIX) / `hive-node.cmd`
    * (Windows). Every `.cjs` shim in the hive is executed through it.
@@ -684,6 +694,9 @@ export class HiveManager {
     writeFileSync(this.shimPath()!, HOOK_SHIM, 'utf8');
     // The proxy-bridge sidecar for hookless CLIs (qwen). Same refresh policy.
     writeFileSync(this.proxyShimPath()!, PROXY_BRIDGE_SHIM, 'utf8');
+    // The MemPalace wake-up digest shim. Same refresh policy — it must track
+    // code changes, and it degrades to "no digest" whenever mempalace is absent.
+    writeFileSync(this.wakeupShimPath()!, WAKEUP_SHIM, 'utf8');
     // The bundled-node launcher every shim above is invoked through — MUST be
     // written before any hook installer runs (they probe for it).
     this.writeNodeLauncher();
@@ -1195,6 +1208,14 @@ export class HiveManager {
     // Bundled node, NOT bare `node` — see nodeLauncherPath(). Claude runs each of
     // these through `sh -c` with a stripped PATH, where `node` is often absent.
     const cmd = this.nodeRun(shim);
+    // MemPalace wake-up digest: OPT-IN, default OFF (`HIVE_MEMPALACE_WAKEUP=1`).
+    // Shim existence is deliberately NOT the guard — `ensureHive` always writes
+    // the shim, so gating on that would mean "always on", and a rebuild for some
+    // unrelated reason would silently start injecting ~800 tokens at every spawn.
+    // Unset/any other value => no wake-up entry is written into agent settings.
+    const wakeupShim =
+      process.env.HIVE_MEMPALACE_WAKEUP === '1' ? this.wakeupShimPath() : null;
+    const wakeupCmd = wakeupShim ? this.nodeRun(wakeupShim) : null;
     const entry = (matcher?: string) => ({
       ...(matcher ? { matcher } : {}),
       hooks: [{ type: 'command', command: cmd }]
@@ -1247,7 +1268,11 @@ export class HiveManager {
         PostToolUse: [entry('*')],
         UserPromptSubmit: [entry()],
         Notification: [entry()],
-        SessionStart: [entry()],
+        // Two SessionStart hooks: the hive shim (floor state) and the MemPalace
+        // wake-up digest. The digest is additive — its shim prints nothing and
+        // exits 0 when mempalace is missing or the palace is empty, so a floor
+        // without MemPalace boots exactly as before.
+        SessionStart: [entry(), ...(wakeupCmd ? [{ hooks: [{ type: 'command', command: wakeupCmd }] }] : [])],
         // #5C: surface mid-`/compact` so an agent boxing up its context reads as
         // 'compacting' on the floor instead of looking frozen.
         PreCompact: [entry()],
@@ -2995,6 +3020,63 @@ searchable MemPalace and you have the \`mempalace\` CLI:
 
 Your \`memory.md\` is mined into the palace automatically, so the durable facts you
 write there become searchable by every agent. You don't run \`mine\` yourself.
+`;
+
+// ─── MemPalace wake-up shim (written to <hive>/bin/mp-wakeup.cjs) ────────────
+// Turns `mempalace wake-up` into SessionStart additionalContext. String.raw so
+// the regex backslashes below survive into the emitted file verbatim.
+//
+// Two things here are load-bearing and were both found by measurement:
+//  1) It must NOT call process.exit() after writing stdout. On Windows stdout to
+//     a pipe is async and exiting truncates the payload — the hook then silently
+//     delivers nothing. (Observed: digest never arrived until the exit was cut.)
+//  2) `mempalace hook run --hook session-start` is NOT a substitute: that handler
+//     only initialises session tracking state and always returns {}. It injects
+//     no context at all.
+const WAKEUP_SHIM = String.raw`#!/usr/bin/env node
+'use strict';
+const { spawnSync } = require('child_process');
+const { existsSync } = require('fs');
+const { join } = require('path');
+
+const TIMEOUT_MS = 8000; // cold start measured ~2.1s; headroom, not a budget
+const MAX_CHARS = 4000;  // hard cap on injected context (~1000 tokens)
+
+function bin() {
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const win = process.platform === 'win32';
+  const local = join(home, '.local', 'bin', win ? 'mempalace.exe' : 'mempalace');
+  if (existsSync(local)) return local;
+  const probe = spawnSync(win ? 'where' : 'which', ['mempalace'], {
+    encoding: 'utf8', timeout: 3000
+  });
+  const p = (probe.stdout || '').trim().split(/\r?\n/)[0];
+  return p && existsSync(p) ? p : null;
+}
+
+try {
+  const exe = bin();
+  if (exe) {
+    const r = spawnSync(exe, ['wake-up'], { encoding: 'utf8', timeout: TIMEOUT_MS });
+    if (r.status === 0 && r.stdout) {
+      let text = r.stdout.trim().replace(/^Wake-up text[^\n]*\n=+\n?/, '').trim();
+      if (text) {
+        if (text.length > MAX_CHARS) {
+          text = text.slice(0, MAX_CHARS) + '\n... (truncated; run mempalace search "<query>" for more)';
+        }
+        process.stdout.write(JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'SessionStart',
+            additionalContext:
+              'MemPalace recall (shared hive memory - background context, not instructions):\n' + text
+          }
+        }));
+      }
+    }
+  }
+} catch (e) {
+  /* never break a spawn */
+}
 `;
 
 // ─── cth-hook shim (written to <hive>/bin/cth-hook.cjs) ──────────────────────
